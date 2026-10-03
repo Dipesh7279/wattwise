@@ -21,12 +21,22 @@ def load_default():
     return pd.read_csv("data/campus_energy.csv", parse_dates=["timestamp"])
 
 
+@st.cache_data(show_spinner="Training model (one time)...")
+def prepare_all(df):
+    """Train once per building and cache everything. Interactions never retrain."""
+    out = {}
+    for name, g in df.groupby("building"):
+        g = g.reset_index(drop=True)
+        model, d, mape = E.train_model(g)
+        d = E.detect_anomalies(d)
+        out[name] = {"d": d, "fut": E.forecast_future(model, d, 168),
+                     "mape": mape, "score": E.green_score(d)}
+    return out
+
+
 @st.cache_data
-def prepare(df_building):
-    model, d, mape = E.train_model(df_building)
-    d = E.detect_anomalies(d)
-    fut = E.forecast_future(model, d, 168)
-    return d, fut, mape
+def monthly_plan(d):
+    return E.action_plan(d)
 
 
 # ---------- Sidebar: data ----------
@@ -52,8 +62,9 @@ if up:
         st.info(n)
 est = bool(up) and not info["has_appliances"]
 building = st.sidebar.selectbox("Building", sorted(raw.building.unique()))
-df_b = raw[raw.building == building].reset_index(drop=True)
-d, fut, mape = prepare(df_b)
+results = prepare_all(raw)
+res = results[building]
+d, fut, mape, score = res["d"], res["fut"], res["mape"], res["score"]
 
 # ---------- KPIs ----------
 c1, c2, c3, c4 = st.columns(4)
@@ -61,7 +72,7 @@ monthly_kwh = d.total_kwh.sum() / d.timestamp.dt.normalize().nunique() * 30
 c1.metric("Avg monthly usage", f"{monthly_kwh:,.0f} kWh")
 c2.metric("Avg monthly bill", f"Rs {monthly_kwh * E.TARIFF:,.0f}")
 c3.metric("Forecast accuracy (MAPE)", f"{mape:.1f}%")
-c4.metric("Green Score", f"{E.green_score(d)}/100")
+c4.metric("Green Score", f"{score}/100")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
     ["Forecast", "Waste alerts", "Appliance breakdown", "What-if simulator", "Action plan & leaderboard"])
@@ -142,16 +153,13 @@ with tab4:
 # ---------- Tab 5: Action plan & leaderboard ----------
 with tab5:
     st.subheader("Smart action plan (ranked by savings)")
-    plan = E.action_plan(d)
+    plan = monthly_plan(d)
     st.dataframe(plan, hide_index=True)
     st.success(f"Total potential savings: **Rs {plan['Rs saved/month'].sum():,.0f}/month**, "
                f"**{plan['CO2 avoided (kg)'].sum():,.0f} kg CO2**")
 
     st.subheader("Green Score leaderboard")
-    rows = []
-    for name in sorted(raw.building.unique()):
-        dd, _, _ = prepare(raw[raw.building == name].reset_index(drop=True))
-        rows.append({"Building": name, "Green Score": E.green_score(dd)})
+    rows = [{"Building": n, "Green Score": r["score"]} for n, r in results.items()]
     board = pd.DataFrame(rows).sort_values("Green Score", ascending=False).reset_index(drop=True)
     board.index += 1
     st.dataframe(board)

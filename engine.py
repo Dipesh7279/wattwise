@@ -32,7 +32,7 @@ def train_model(df):
     df = add_time_features(df)
     FEATURES = features_for(df)
     split = int(len(df) * 0.8)
-    params = dict(n_estimators=250, max_depth=5, learning_rate=0.08, subsample=0.9)
+    params = dict(n_estimators=150, max_depth=5, learning_rate=0.08, subsample=0.9, n_jobs=2)
     m = xgb.XGBRegressor(**params).fit(df[FEATURES][:split], df.total_kwh[:split])
     pred = m.predict(df[FEATURES][split:])
     actual = df.total_kwh[split:].values
