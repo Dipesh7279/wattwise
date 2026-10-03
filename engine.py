@@ -10,7 +10,12 @@ CO2_FACTOR = 0.82     # kg CO2 per kWh (India grid average)
 APPLIANCES = {"ac": "ac_kwh", "fan": "fan_kwh", "light": "lights_kwh",
               "lights": "lights_kwh", "geyser": "geyser_kwh", "fridge": "fridge_kwh"}
 APP_COLS = ["ac_kwh", "fan_kwh", "lights_kwh", "geyser_kwh", "fridge_kwh"]
-FEATURES = ["hour", "dow", "month", "is_weekend", "temp"]
+BASE_FEATURES = ["hour", "dow", "month", "is_weekend"]
+
+
+def features_for(df):
+    """Use temperature only if the data has it."""
+    return BASE_FEATURES + (["temp"] if "temp" in df.columns else [])
 
 
 def add_time_features(df):
@@ -25,6 +30,7 @@ def add_time_features(df):
 def train_model(df):
     """Train on first 80%, report MAPE on last 20%, then refit on all data."""
     df = add_time_features(df)
+    FEATURES = features_for(df)
     split = int(len(df) * 0.8)
     params = dict(n_estimators=250, max_depth=5, learning_rate=0.08, subsample=0.9)
     m = xgb.XGBRegressor(**params).fit(df[FEATURES][:split], df.total_kwh[:split])
@@ -38,13 +44,15 @@ def train_model(df):
 
 def forecast_future(model, df, hours=168):
     """Forecast next `hours` using typical temperature for that (month, hour)."""
-    typical = df.groupby(["month", "hour"]).temp.mean()
+    FEATURES = features_for(df)
     future = pd.DataFrame({"timestamp": pd.date_range(
         df.timestamp.max() + pd.Timedelta(hours=1), periods=hours, freq="h")})
     future = add_time_features(future)
-    last_m = df.month.iloc[-1]   # fall back to the latest month seen if the month is new
-    future["temp"] = [typical.get((m, h), typical.get((last_m, h), df.temp.mean()))
-                      for m, h in zip(future.month, future.hour)]
+    if "temp" in df.columns:
+        typical = df.groupby(["month", "hour"]).temp.mean()
+        last_m = df.month.iloc[-1]   # fall back to latest month seen if the month is new
+        future["temp"] = [typical.get((m, h), typical.get((last_m, h), df.temp.mean()))
+                          for m, h in zip(future.month, future.hour)]
     future["pred"] = model.predict(future[FEATURES])
     return future
 
@@ -59,7 +67,7 @@ def detect_anomalies(df):
     return d
 
 
-def describe_anomalies(d):
+def describe_anomalies(d, estimated=False):
     """Group consecutive anomalous hours into readable alerts."""
     a = d[d.anomaly].copy()
     if a.empty:
@@ -67,8 +75,8 @@ def describe_anomalies(d):
     a["day"] = a.timestamp.dt.date
     out = []
     for day, g in a.groupby("day"):
-        worst = g[APP_COLS[:3]].sum().idxmax().replace("_kwh", "").upper()
-        out.append(f"{day}: {worst} over-use from {g.timestamp.min():%I %p} to "
+        worst = "Usage" if estimated else g[APP_COLS[:3]].sum().idxmax().replace("_kwh", "").upper() + " over-use"
+        out.append(f"{day}: {worst} from {g.timestamp.min():%I %p} to "
                    f"{g.timestamp.max():%I %p}, about {g.resid.sum():.0f} kWh above normal")
     return out[-8:][::-1]
 
@@ -133,3 +141,102 @@ def green_score(df):
     night = d[d.hour.between(1, 5)][["ac_kwh", "lights_kwh"]].sum().sum()
     ratio = (waste_kwh + 0.3 * night) / d.total_kwh.sum()
     return int(np.clip(100 - ratio * 700, 0, 100))
+
+
+# ---------------- Real-data support ----------------
+ALIASES = {
+    "timestamp": ["timestamp", "datetime", "date_time", "date", "time"],
+    "total_kwh": ["total_kwh", "kwh", "energy_kwh", "consumption", "usage", "energy", "units"],
+    "temp": ["temp", "temperature", "temp_c"],
+    "building": ["building", "site", "meter", "location"],
+}
+
+
+def estimate_split(df):
+    """Estimate per-appliance split from total usage using typical campus patterns.
+    This is an ESTIMATE (a simple stand-in for NILM), not measured data."""
+    h = df.timestamp.dt.hour
+    m = df.timestamp.dt.month
+    if "temp" in df.columns:
+        heat = ((df.temp - 26) / 12).clip(0, 1)
+    else:
+        heat = m.map(lambda x: 0.8 if x in (4, 5, 6) else 0.5 if x in (3, 7, 8, 9, 10) else 0.1)
+    night = ((h >= 18) | (h <= 8)).astype(float)
+    dark = ((h >= 18) | (h <= 6)).astype(float)
+    w = pd.DataFrame({
+        "ac_kwh": heat * (0.6 + 0.4 * night) * 10,
+        "fan_kwh": 1.0 + night * 0.5,
+        "lights_kwh": 0.05 + dark * 1.2,
+        "geyser_kwh": ((h >= 5) & (h <= 8)).astype(float) * 1.5 * (1 - heat),
+        "fridge_kwh": 0.6,
+    }, index=df.index)
+    w = w.div(w.sum(axis=1), axis=0)
+    out = df.copy()
+    for c in APP_COLS:
+        out[c] = (df.total_kwh * w[c]).round(3)
+    return out
+
+
+def standardize(raw):
+    """Clean a user CSV. Returns (df, info). Raises ValueError with a friendly message."""
+    df = raw.copy()
+    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
+    rename = {}
+    for std, names in ALIASES.items():
+        if std not in df.columns:
+            hit = next((n for n in names if n in df.columns), None)
+            if hit:
+                rename[hit] = std
+    df = df.rename(columns=rename)
+
+    if "timestamp" not in df.columns:
+        raise ValueError("No timestamp column found. Add a column named 'timestamp' (e.g. 2026-01-01 13:00:00).")
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", dayfirst=False)
+    df = df.dropna(subset=["timestamp"])
+
+    present = [c for c in APP_COLS if c in df.columns]
+    if "total_kwh" not in df.columns:
+        if present:
+            df["total_kwh"] = df[present].sum(axis=1)
+        else:
+            raise ValueError("No energy column found. Add 'total_kwh' (or kwh / consumption / usage).")
+    df["total_kwh"] = pd.to_numeric(df["total_kwh"], errors="coerce")
+    if "building" not in df.columns:
+        df["building"] = "My Building"
+
+    has_temp = "temp" in df.columns and pd.to_numeric(df["temp"], errors="coerce").notna().mean() > 0.9
+    if "temp" in df.columns:
+        df["temp"] = pd.to_numeric(df["temp"], errors="coerce")
+    if not has_temp:
+        df = df.drop(columns=["temp"], errors="ignore")
+    has_appliances = len(present) == len(APP_COLS)
+
+    parts, notes = [], []
+    for b, g in df.groupby("building"):
+        g = g.sort_values("timestamp").drop_duplicates("timestamp")
+        step = g.timestamp.diff().median()
+        if pd.notna(step) and step > pd.Timedelta(hours=1):
+            raise ValueError(f"'{b}': data is every {step}, but hourly (or finer) data is needed.")
+        agg = {c: "sum" for c in ["total_kwh"] + (present if has_appliances else [])}
+        if has_temp:
+            agg["temp"] = "mean"
+        if pd.notna(step) and step < pd.Timedelta(hours=1):
+            g = g.set_index("timestamp").resample("h").agg(agg).reset_index()
+            g["building"] = b
+            notes.append(f"{b}: finer-than-hourly readings were summed to hourly.")
+        else:
+            g = g.set_index("timestamp").reindex(
+                pd.date_range(g.timestamp.min(), g.timestamp.max(), freq="h")).rename_axis("timestamp").reset_index()
+            g["building"] = b
+        num = [c for c in g.columns if c not in ("timestamp", "building")]
+        g[num] = g[num].interpolate(limit=6).ffill().bfill()
+        g = g.dropna(subset=["total_kwh"])
+        if len(g) < 24 * 14:
+            raise ValueError(f"'{b}': only {len(g)} hourly rows. Please provide at least 14 days (60+ days is better).")
+        if not has_appliances:
+            g = estimate_split(g)
+        parts.append(g)
+
+    out = pd.concat(parts, ignore_index=True)
+    info = {"has_temp": has_temp, "has_appliances": has_appliances, "notes": notes}
+    return out, info

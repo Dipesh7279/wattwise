@@ -32,11 +32,25 @@ def prepare(df_building):
 # ---------- Sidebar: data ----------
 st.sidebar.header("Data")
 up = st.sidebar.file_uploader("Upload your CSV (optional)", type="csv")
-raw = pd.read_csv(up, parse_dates=["timestamp"]) if up else load_default()
-if "building" not in raw.columns:
-    raw["building"] = "My Building"
-st.sidebar.caption("Required columns: timestamp, building, ac_kwh, fan_kwh, lights_kwh, "
-                   "geyser_kwh, fridge_kwh, total_kwh, temp")
+st.sidebar.caption("Minimum: **timestamp** + **total_kwh** (hourly, 14+ days). "
+                   "Optional: temp, ac_kwh, fan_kwh, lights_kwh, geyser_kwh, fridge_kwh, building.")
+st.sidebar.download_button("Download sample template", "timestamp,total_kwh\n2026-01-01 00:00:00,12.5\n"
+                           "2026-01-01 01:00:00,11.8\n", "template.csv", "text/csv")
+try:
+    source = pd.read_csv(up) if up else load_default()
+    raw, info = E.standardize(source)
+except Exception as ex:
+    st.error(f"Could not read the file: {ex}")
+    st.stop()
+if up:
+    if not info["has_appliances"]:
+        st.warning("Appliance-wise data not found. The breakdown below is an **ESTIMATE** based on typical "
+                   "campus usage patterns (simple NILM stand-in). Totals, forecast and waste alerts use your real data.")
+    if not info["has_temp"]:
+        st.info("No temperature column found. The forecast uses time patterns only.")
+    for n in info["notes"]:
+        st.info(n)
+est = bool(up) and not info["has_appliances"]
 building = st.sidebar.selectbox("Building", sorted(raw.building.unique()))
 df_b = raw[raw.building == building].reset_index(drop=True)
 d, fut, mape = prepare(df_b)
@@ -68,7 +82,7 @@ with tab1:
 # ---------- Tab 2: Waste alerts ----------
 with tab2:
     st.subheader("Automatic waste detection (Isolation Forest on forecast residuals)")
-    alerts = E.describe_anomalies(d)
+    alerts = E.describe_anomalies(d, est)
     if alerts:
         for a in alerts:
             st.error("🚨 " + a)
@@ -83,7 +97,7 @@ with tab2:
 
 # ---------- Tab 3: Breakdown ----------
 with tab3:
-    st.subheader("Where does the energy go?")
+    st.subheader("Where does the energy go?" + (" (estimated split)" if est else ""))
     share = d[E.APP_COLS].sum().rename(lambda x: x.replace("_kwh", "").title())
     left, right = st.columns(2)
     left.plotly_chart(px.pie(values=share.values, names=share.index, hole=0.45))
@@ -92,7 +106,7 @@ with tab3:
 
 # ---------- Tab 4: What-if ----------
 with tab4:
-    st.subheader("What-if simulator")
+    st.subheader("What-if simulator" + (" (based on estimated appliance split)" if est else ""))
     q = st.text_input("Ask a question",
                       placeholder="e.g. turn off AC after 10 PM   |   reduce lights from 12 am to 5 am by 50%")
     parsed = E.parse_question(q) if q else None
